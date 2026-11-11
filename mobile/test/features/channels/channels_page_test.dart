@@ -361,6 +361,19 @@ void main() {
   ) async {
     final channels = [
       testChannels.first,
+      for (final creator in ['aabb', 'other', 'agent'])
+        Channel(
+          id: 'labeled-$creator',
+          name: 'labeled-$creator',
+          channelType: 'stream',
+          visibility: 'private',
+          labels: const ['buzz.solo'],
+          description: '',
+          createdBy: creator,
+          createdAt: DateTime(2025),
+          memberCount: 2,
+          isMember: true,
+        ),
       for (final type in ['stream', 'solo'])
         Channel(
           id: 'private-$type',
@@ -378,6 +391,7 @@ void main() {
       buildTestable(
         overrides: [
           channelsProvider.overrideWith(() => _FakeNotifier(channels)),
+          myPubkeyProvider.overrideWithValue('aabb'),
         ],
       ),
     );
@@ -391,6 +405,9 @@ void main() {
     expect(tester.widget<Icon>(privateIcon).icon, BuzzIcons.lock);
     expect(tester.getTopLeft(publicIcon).dx, tester.getTopLeft(privateIcon).dx);
     expect(find.text('private-solo'), findsNothing);
+    for (final creator in ['aabb', 'other', 'agent']) {
+      expect(find.text('labeled-$creator'), findsNothing);
+    }
   });
 
   testWidgets('shows grouped channel list when data loads', (tester) async {
