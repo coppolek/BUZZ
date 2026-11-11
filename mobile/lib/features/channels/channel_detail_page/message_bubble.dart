@@ -483,7 +483,7 @@ class _MessageBubble extends HookConsumerWidget {
         ),
       ),
     );
-    return MessageSwipeReply(
+    final bubble = MessageSwipeReply(
       contentKey: swipeContentKey,
       message: message,
       allMessages: allMessages,
@@ -493,6 +493,13 @@ class _MessageBubble extends HookConsumerWidget {
       isArchived: isArchived,
       child: content,
     );
+    return message.shouldFoldAgentAudience
+        ? _AgentAudienceFold(
+            message: message,
+            channelId: currentChannelId,
+            child: bubble,
+          )
+        : bubble;
   }
 }
 
