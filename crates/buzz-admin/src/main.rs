@@ -22,6 +22,7 @@
 mod communities;
 mod deletions;
 mod nip_fi;
+mod nip_fi_policy;
 mod user_deletions;
 
 use std::future::Future;
@@ -38,7 +39,7 @@ use buzz_db::{
 use buzz_media::{BucketSnapshot, MediaConfig, MediaStorage, S3AddressingStyle, SweepError};
 use buzz_pubsub::{EventTopic, PubSubManager};
 use clap::{Parser, Subcommand};
-use nostr::{EventBuilder, Keys, Kind, Tag, ToBech32};
+use nostr::{EventBuilder, Keys, Kind, Tag};
 use serde::Serialize;
 use sqlx::Row;
 use tracing::warn;
@@ -46,14 +47,6 @@ use tracing::warn;
 #[derive(Parser)]
 #[command(name = "buzz-admin", about = "Buzz instance administration")]
 struct Cli {
-    /// daz-secrets service containing the relay signing identity.
-    #[arg(long, global = true, default_value = "buzz-relay")]
-    secret_service: String,
-
-    /// daz-secrets account containing the relay signing identity.
-    #[arg(long, global = true, default_value = "identity")]
-    secret_account: String,
-
     #[command(subcommand)]
     command: Command,
 }
@@ -64,7 +57,9 @@ enum Command {
     ///
     /// Accepts a bech32 npub or 64-char hex pubkey. After inserting the DB row,
     /// publishes a kind:13534 membership roster via Redis so live clients see
-    /// the updated list immediately.
+    /// the updated list immediately. Does not join the member to the
+    /// community's default (`auto_join`) channels: the relay does that on an
+    /// invite claim or a kind:9030 add, which this command bypasses.
     AddMember {
         /// Nostr public key — bech32 npub or 64-char hex.
         #[arg(long)]
@@ -130,6 +125,8 @@ enum Command {
         #[command(subcommand)]
         command: nip_fi::NipFiCommand,
     },
+    /// Change or inspect a community stored NIP-FI requirement.
+    NipFiPolicy(nip_fi_policy::Args),
     /// Durable CLI-only whole-community deletion control plane.
     Deletions {
         #[command(subcommand)]
@@ -145,12 +142,17 @@ enum Command {
     ///
     /// Without `--channel`, only channels missing discovery metadata are
     /// reconciled. With `--channel`, only that channel's member snapshot is
-    /// replaced; canonical metadata and admin events remain untouched. Events
-    /// are always signed with the relay identity from the secret provider.
+    /// replaced; canonical metadata and admin events remain untouched.
     ReconcileChannels {
         /// Optional channel UUID to force-republish.
         #[arg(long)]
         channel: Option<String>,
+
+        /// Relay private key (hex) for signing events. Falls back to
+        /// BUZZ_RELAY_PRIVATE_KEY env var. If neither is set, generates
+        /// an ephemeral key (events will be unverifiable after restart).
+        #[arg(long)]
+        relay_key: Option<String>,
     },
 }
 
@@ -187,28 +189,12 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<i32> {
-    let secret_service = cli.secret_service;
-    let secret_account = cli.secret_account;
     match cli.command {
         Command::GenerateKey => {
-            let client = daz_secrets::BlockingClient::from_default_config()
-                .map_err(|_| anyhow::anyhow!("secret provider is unavailable"))?;
-            match client.get(&secret_service, &secret_account) {
-                Ok(_) => anyhow::bail!("relay identity already exists; refusing to overwrite it"),
-                Err(error) if error.code() == daz_secrets::ErrorCode::NotFound => {}
-                Err(_) => anyhow::bail!("secret provider is unavailable"),
-            }
             let keys = Keys::generate();
-            let nsec = zeroize::Zeroizing::new(
-                keys.secret_key()
-                    .to_bech32()
-                    .map_err(|_| anyhow::anyhow!("failed to encode generated identity"))?,
-            );
-            client
-                .set(&secret_service, &secret_account, nsec.as_bytes(), None)
-                .map_err(|_| anyhow::anyhow!("failed to store generated identity"))?;
             println!("Public key:  {}", keys.public_key().to_hex());
-            println!("Stored in secret provider: {secret_service}/{secret_account}");
+            println!("Secret key:  {}", keys.secret_key().display_secret());
+            println!("\nSet BUZZ_PRIVATE_KEY to the secret key to use this identity.");
             Ok(0)
         }
         Command::Migrate => {
@@ -219,13 +205,9 @@ async fn run(cli: Cli) -> Result<i32> {
         }
         Command::StorageSnapshot { max_objects } => cmd_storage_snapshot(max_objects).await,
         Command::PartitionAudit { months_ahead } => cmd_partition_audit(months_ahead).await,
-        Command::AddMember { pubkey, role } => {
-            cmd_add_member(pubkey, role, &secret_service, &secret_account).await
-        }
-        Command::RemoveMember { pubkey, role } => {
-            cmd_remove_member(pubkey, role, &secret_service, &secret_account).await
-        }
-        Command::RepublishMembers => cmd_republish_members(&secret_service, &secret_account).await,
+        Command::AddMember { pubkey, role } => cmd_add_member(pubkey, role).await,
+        Command::RemoveMember { pubkey, role } => cmd_remove_member(pubkey, role).await,
+        Command::RepublishMembers => cmd_republish_members().await,
         Command::ListMembers => cmd_list_members().await,
         Command::ProductFeedback {
             command: ProductFeedbackCommand::List { limit },
@@ -234,8 +216,13 @@ async fn run(cli: Cli) -> Result<i32> {
         Command::Deletions { command } => deletions::run(command).await,
         Command::UserDeletions { command } => user_deletions::run(command).await,
         Command::NipFi { command } => nip_fi::run(command).await,
-        Command::ReconcileChannels { channel } => {
-            reconcile_channels(channel, &secret_service, &secret_account).await?;
+        // Retain transport/file causes for this operator command without changing
+        // the diagnostics of other admin commands. Key parse errors are redacted.
+        Command::NipFiPolicy(args) => nip_fi_policy::run(args)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:#}")),
+        Command::ReconcileChannels { channel, relay_key } => {
+            reconcile_channels(channel, relay_key).await?;
             Ok(0)
         }
     }
@@ -473,12 +460,7 @@ fn partition_audit_exit_code(outcome: PartitionAuditOutcome) -> i32 {
     }
 }
 
-async fn cmd_add_member(
-    pubkey_arg: String,
-    role: String,
-    secret_service: &str,
-    secret_account: &str,
-) -> Result<i32> {
+async fn cmd_add_member(pubkey_arg: String, role: String) -> Result<i32> {
     if let Err(msg) = validate_role(&role) {
         eprintln!("error: {msg}");
         return Ok(1);
@@ -492,8 +474,7 @@ async fn cmd_add_member(
         }
     };
 
-    let (db, pubsub, relay_keypair) =
-        connect_member_services(secret_service, secret_account).await?;
+    let (db, pubsub, relay_keypair) = connect_member_services().await?;
 
     let tenant = resolve_admin_tenant(&db).await?;
     let write = match db
@@ -516,12 +497,7 @@ async fn cmd_add_member(
     Ok(0)
 }
 
-async fn cmd_remove_member(
-    pubkey_arg: String,
-    role_filter: Option<String>,
-    secret_service: &str,
-    secret_account: &str,
-) -> Result<i32> {
+async fn cmd_remove_member(pubkey_arg: String, role_filter: Option<String>) -> Result<i32> {
     if let Some(ref role) = role_filter {
         if let Err(msg) = validate_role(role) {
             eprintln!("error: {msg}");
@@ -537,8 +513,7 @@ async fn cmd_remove_member(
         }
     };
 
-    let (db, pubsub, relay_keypair) =
-        connect_member_services(secret_service, secret_account).await?;
+    let (db, pubsub, relay_keypair) = connect_member_services().await?;
 
     let tenant = resolve_admin_tenant(&db).await?;
     use buzz_db::relay_members::RemoveResult;
@@ -580,9 +555,8 @@ async fn cmd_remove_member(
     Ok(0)
 }
 
-async fn cmd_republish_members(secret_service: &str, secret_account: &str) -> Result<i32> {
-    let (db, pubsub, relay_keypair) =
-        connect_member_services(secret_service, secret_account).await?;
+async fn cmd_republish_members() -> Result<i32> {
+    let (db, pubsub, relay_keypair) = connect_member_services().await?;
     let tenant = resolve_admin_tenant(&db).await?;
     let write = match db
         .rewrite_nip43_membership_list(tenant.community(), &relay_keypair)
@@ -680,22 +654,25 @@ async fn fan_out_membership_list(
 
 /// Connect to DB, Redis pub/sub, and load the relay keypair.
 ///
-/// The relay identity is required — the CLI signs kind:13534 events.
-async fn connect_member_services(
-    secret_service: &str,
-    secret_account: &str,
-) -> Result<(Db, Arc<PubSubManager>, Keys)> {
+/// `BUZZ_RELAY_PRIVATE_KEY` is required — the CLI signs kind:13534 events.
+async fn connect_member_services() -> Result<(Db, Arc<PubSubManager>, Keys)> {
     let db = connect_db().await?;
-    let relay_keypair = load_relay_keys(secret_service, secret_account)?;
+
+    let relay_keypair = {
+        let hex = std::env::var("BUZZ_RELAY_PRIVATE_KEY").map_err(|_| {
+            anyhow::anyhow!(
+                "BUZZ_RELAY_PRIVATE_KEY is required for add-member/remove-member/republish-members.\n\
+                 The relay must have a stable signing key to publish kind:13534 events."
+            )
+        })?;
+        Keys::parse(&hex).map_err(|e| anyhow::anyhow!("invalid BUZZ_RELAY_PRIVATE_KEY: {e}"))?
+    };
 
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
 
-    let redis_pool = {
-        let cfg = deadpool_redis::Config::from_url(&redis_url);
-        cfg.create_pool(Some(deadpool_redis::Runtime::Tokio1))
-            .map_err(|e| anyhow::anyhow!("Redis pool creation failed: {e}"))?
-    };
+    let redis_pool = buzz_pubsub::redis_connection(&redis_url)
+        .map_err(|e| anyhow::anyhow!("Redis connection setup failed: {e}"))?;
 
     let pubsub = Arc::new(
         PubSubManager::new(&redis_url, redis_pool)
@@ -749,22 +726,9 @@ async fn resolve_admin_tenant(db: &Db) -> Result<TenantContext> {
     Ok(TenantContext::resolved(record.id, record.host))
 }
 
-fn load_relay_keys(secret_service: &str, secret_account: &str) -> Result<Keys> {
-    let client = daz_secrets::BlockingClient::from_default_config()
-        .map_err(|_| anyhow::anyhow!("secret provider is unavailable"))?;
-    let secret = client
-        .get(secret_service, secret_account)
-        .map_err(|_| anyhow::anyhow!("relay signing identity is unavailable"))?;
-    let secret_value = zeroize::Zeroizing::new(secret.value);
-    let encoded = std::str::from_utf8(&secret_value)
-        .map_err(|_| anyhow::anyhow!("relay signing identity is not valid UTF-8"))?;
-    Keys::parse(encoded.trim()).map_err(|_| anyhow::anyhow!("relay signing identity is invalid"))
-}
-
 async fn reconcile_channels(
     channel_arg: Option<String>,
-    secret_service: &str,
-    secret_account: &str,
+    relay_key_arg: Option<String>,
 ) -> Result<()> {
     use buzz_core::channel::group_state_identity_tags;
     use buzz_core::kind::KIND_NIP29_GROUP_ADMINS;
@@ -772,7 +736,31 @@ async fn reconcile_channels(
 
     let db = connect_db().await?;
 
-    let relay_keys = load_relay_keys(secret_service, secret_account)?;
+    // Resolve relay signing key: arg > env > ephemeral. Force-republish must
+    // never use an ephemeral key because it replaces an existing authoritative
+    // snapshot.
+    let configured_relay_key =
+        relay_key_arg.or_else(|| std::env::var("BUZZ_RELAY_PRIVATE_KEY").ok());
+    if channel_arg.is_some() && configured_relay_key.is_none() {
+        return Err(anyhow::anyhow!(
+            "--channel requires --relay-key or BUZZ_RELAY_PRIVATE_KEY"
+        ));
+    }
+    let relay_keys = match configured_relay_key {
+        Some(key_hex) => {
+            Keys::parse(&key_hex).map_err(|e| anyhow::anyhow!("invalid relay key: {e}"))?
+        }
+        None => {
+            let k = Keys::generate();
+            eprintln!(
+                "Warning: no relay key provided — using ephemeral key {}",
+                k.public_key().to_hex()
+            );
+            eprintln!("Events signed with this key won't be verifiable after this run.");
+            eprintln!("Pass --relay-key or set BUZZ_RELAY_PRIVATE_KEY for production use.");
+            k
+        }
+    };
 
     let tenant = resolve_admin_tenant(&db).await?;
     let target_channel = channel_arg
