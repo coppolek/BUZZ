@@ -22,29 +22,44 @@ pub(super) struct Rule {
     pub name: &'static str,
     pub community_scope: bool,
     pub allowed: &'static [Decision],
-    pub decide: fn(&Value) -> Result<Decision>,
+    pub decide: fn(&Value, &Value) -> Result<Decision>,
 }
 
 pub(super) const INITIAL_STAGE: &str = "gate_user";
 const COMMUNITY_INITIAL_STAGE: &str = "purge_db";
 const RULES: &[Rule] = &[
     Rule {
-        name: "gate_user",
+        name: "purge_media",
         community_scope: false,
         allowed: &[Decision::EnterCommunities],
-        decide: |_| Ok(Decision::EnterCommunities),
+        decide: |_, _| Ok(Decision::EnterCommunities),
+    },
+    Rule {
+        name: "gate_user",
+        community_scope: false,
+        allowed: &[Decision::EnterCommunities, Decision::Stage("purge_media")],
+        decide: |inputs, _| {
+            let target = inputs["target"]
+                .as_str()
+                .ok_or_else(|| invalid("missing gate target"))?;
+            Ok(if target.starts_with("demo:") {
+                Decision::EnterCommunities
+            } else {
+                Decision::Stage("purge_media")
+            })
+        },
     },
     Rule {
         name: "purge_db",
         community_scope: true,
         allowed: &[Decision::Stage("purge_agents"), Decision::CommunityComplete],
-        decide: after_purge_db,
+        decide: |_, result| after_purge_db(result),
     },
     Rule {
         name: "purge_agents",
         community_scope: true,
         allowed: &[Decision::CommunityComplete],
-        decide: |_| Ok(Decision::CommunityComplete),
+        decide: |_, _| Ok(Decision::CommunityComplete),
     },
 ];
 
@@ -76,7 +91,7 @@ pub(super) fn decision(stage: &EntityStage) -> Result<Decision> {
         .metadata_json
         .get("result")
         .ok_or_else(|| invalid("completed stage has no saved result"))?;
-    let next = (rule.decide)(result)?;
+    let next = (rule.decide)(&stage.metadata_json["inputs"], result)?;
     if !rule.allowed.contains(&next) {
         return Err(invalid("stage selected a disallowed transition"));
     }
@@ -222,6 +237,32 @@ impl Progress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gating_precedes_global_media_for_real_users() {
+        assert_eq!(INITIAL_STAGE, "gate_user");
+        let gate = rule(INITIAL_STAGE).unwrap();
+        assert!(!gate.community_scope);
+        for (target, expected) in [
+            ("demo:alice".to_owned(), Decision::EnterCommunities),
+            ("a".repeat(64), Decision::Stage("purge_media")),
+        ] {
+            assert_eq!(
+                (gate.decide)(
+                    &serde_json::json!({"target": target}),
+                    &serde_json::json!({})
+                )
+                .unwrap(),
+                expected
+            );
+        }
+        let media = rule("purge_media").unwrap();
+        assert!(!media.community_scope);
+        assert_eq!(
+            (media.decide)(&serde_json::json!({}), &serde_json::json!({})).unwrap(),
+            Decision::EnterCommunities
+        );
+    }
 
     #[test]
     fn stage_options_follow_the_workflow_definition() {
