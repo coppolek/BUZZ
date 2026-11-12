@@ -332,16 +332,20 @@ class ComposeBar extends HookConsumerWidget {
         for (final entry in mentionMap.value.entries)
           entry.key: entry.value.pubkey,
       });
-      // Track the resolved candidate so we can pass its pubkey and prepare
-      // selected non-member agents at send time.
-      mentionMap.value[name] = candidate;
       ref
           .read(mentionHistoryProvider.notifier)
           .remember(channelId, candidate.pubkey);
 
-      final start = mentionStartIdx.value.clamp(0, controller.text.length);
+      var start = mentionStartIdx.value.clamp(0, controller.text.length);
       isModifyingText.value = true;
       try {
+        start = _requalifyNamesakes(
+          controller,
+          mentionMap.value,
+          candidate,
+          start,
+        );
+        mentionMap.value[name] = candidate;
         spliceAndMoveCursor(
           controller,
           focusNode,

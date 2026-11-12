@@ -376,6 +376,46 @@ void spliceAndMoveCursor(
   focusNode.requestFocus();
 }
 
+/// Qualify earlier namesake mentions outside code, keeping the cursor in
+/// place, and rebind [mentions] before the text changes. A key with an
+/// occurrence left in code stays bound beside its qualified label. Returns
+/// [start] shifted by the edits before it. Call it before tracking the new
+/// selection: persistence prunes keys absent from the text.
+int _requalifyNamesakes(
+  _MarkdownEditingController controller,
+  Map<String, MentionCandidate> mentions,
+  MentionCandidate candidate,
+  int start,
+) {
+  final renames = namesakeRequalifications(candidate.label, candidate.pubkey, {
+    for (final entry in mentions.entries) entry.key: entry.value.pubkey,
+  });
+  if (renames.isEmpty) return start;
+  final text = controller.text;
+  final cursor = controller.selection.isValid
+      ? controller.selection.baseOffset
+      : text.length;
+  final code = controller._styledCodeRanges(text);
+  final result = renameMentions(
+    text,
+    mentions.keys,
+    renames,
+    start,
+    // Exactly what the editor draws as code stays as typed.
+    excluded: (from, to) => code.any((c) => c.start < from && to < c.end),
+  );
+  for (final key in result.renamed) {
+    mentions[renames[key]!] = result.kept.contains(key)
+        ? mentions[key]!
+        : mentions.remove(key)!;
+  }
+  controller.value = TextEditingValue(
+    text: result.text,
+    selection: TextSelection.collapsed(offset: cursor + result.offset - start),
+  );
+  return result.offset;
+}
+
 /// Insert [trigger] (e.g. `@` or `#`) at the cursor position, prefixed with
 /// a space if needed for word separation. Used by `triggerMention` and
 /// `triggerChannel`.
