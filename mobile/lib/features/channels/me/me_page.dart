@@ -168,7 +168,7 @@ class MePage extends HookConsumerWidget {
                     (c) =>
                         c.isMember &&
                         !c.isArchived &&
-                        c.isPersonalChat(viewer, organization.channels),
+                        c.isSoloChat(organization.channels),
                   )
                   .toList()
                 ..sort(
@@ -182,8 +182,13 @@ class MePage extends HookConsumerWidget {
             isUnread: unreadIds.contains(channel.id),
             onTap: () => Navigator.of(context).push(
               MaterialPageRoute<void>(
-                builder: (_) =>
-                    ChannelDetailPage(channel: channel, personalChat: true),
+                builder: (_) => ChannelDetailPage(
+                  channel: channel,
+                  personalChat: channel.isPersonalChat(
+                    viewer,
+                    organization.channels,
+                  ),
+                ),
               ),
             ),
             onLongPress: () => showChannelDetailsSheet(
